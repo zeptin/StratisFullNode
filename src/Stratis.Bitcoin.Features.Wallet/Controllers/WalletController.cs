@@ -7,6 +7,7 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Logging;
 using NBitcoin;
 using Stratis.Bitcoin.Builder.Feature;
+using Stratis.Bitcoin.Features.BlockStore;
 using Stratis.Bitcoin.Features.Wallet.Interfaces;
 using Stratis.Bitcoin.Features.Wallet.Models;
 using Stratis.Bitcoin.Features.Wallet.Services;
@@ -25,7 +26,7 @@ namespace Stratis.Bitcoin.Features.Wallet.Controllers
         private readonly IWalletManager walletManager;
         private readonly IWalletSyncManager walletSyncManager;
         private readonly ChainIndexer chainIndexer;
-
+        
         public WalletController(
             ILoggerFactory loggerFactory,
             IWalletService walletService,
@@ -780,6 +781,15 @@ namespace Stratis.Bitcoin.Features.Wallet.Controllers
                                                                                  i.ConfirmedInBlock ==
                                                                                  transaction.BlockHeight);
             return existingTransaction;
+        }
+
+        [HttpPost]
+        [Route("sweep")]
+        public async Task<IActionResult> Sweep([FromBody] SweepRequest request,
+            CancellationToken cancellationToken = default(CancellationToken))
+        {
+            return await this.Execute(request, cancellationToken,
+                async (req, token) => this.Json(await this.walletService.Sweep(req, token)));
         }
     }
 }

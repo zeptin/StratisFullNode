@@ -1,8 +1,12 @@
 ﻿using System;
+using System.Collections.Generic;
+using System.Linq;
 using System.Net;
+using System.Runtime.InteropServices;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Logging;
 using NBitcoin;
+using Newtonsoft.Json;
 using Stratis.Bitcoin.Base;
 using Stratis.Bitcoin.Controllers.Models;
 using Stratis.Bitcoin.Features.BlockStore.AddressIndexing;
@@ -11,6 +15,7 @@ using Stratis.Bitcoin.Interfaces;
 using Stratis.Bitcoin.Utilities;
 using Stratis.Bitcoin.Utilities.JsonErrors;
 using Stratis.Bitcoin.Utilities.ModelStateErrors;
+using Script = NBitcoin.Script;
 
 namespace Stratis.Bitcoin.Features.BlockStore.Controllers
 {
@@ -21,6 +26,7 @@ namespace Stratis.Bitcoin.Features.BlockStore.Controllers
         public const string GetAddressIndexerTip = "addressindexertip";
         public const string GetBlock = "block";
         public const string GetBlockCount = "getblockcount";
+        public const string GetUtxoSet = "getutxoset";
     }
 
     /// <summary>Controller providing operations on a blockstore.</summary>
@@ -30,19 +36,18 @@ namespace Stratis.Bitcoin.Features.BlockStore.Controllers
     {
         private readonly IAddressIndexer addressIndexer;
 
+        private readonly IUtxoIndexer utxoIndexer;
+
         /// <summary>Provides access to the block store on disk.</summary>
         private readonly IBlockStore blockStore;
 
-        /// <summary>Instance logger.</summary>
         private readonly ILogger logger;
 
         /// <summary>An interface that provides information about the chain and validation.</summary>
         private readonly IChainState chainState;
 
-        /// <summary>The chain.</summary>
         private readonly ChainIndexer chainIndexer;
 
-        /// <summary>Current network for the active controller instance.</summary>
         private readonly Network network;
 
         public BlockStoreController(
@@ -51,18 +56,21 @@ namespace Stratis.Bitcoin.Features.BlockStore.Controllers
             IBlockStore blockStore,
             IChainState chainState,
             ChainIndexer chainIndexer,
-            IAddressIndexer addressIndexer)
+            IAddressIndexer addressIndexer,
+            IUtxoIndexer utxoIndexer)
         {
             Guard.NotNull(network, nameof(network));
             Guard.NotNull(loggerFactory, nameof(loggerFactory));
             Guard.NotNull(chainState, nameof(chainState));
             Guard.NotNull(addressIndexer, nameof(addressIndexer));
+            Guard.NotNull(utxoIndexer, nameof(utxoIndexer));
 
             this.addressIndexer = addressIndexer;
             this.network = network;
             this.blockStore = blockStore;
             this.chainState = chainState;
             this.chainIndexer = chainIndexer;
+            this.utxoIndexer = utxoIndexer;
             this.logger = loggerFactory.CreateLogger(this.GetType().FullName);
         }
 
@@ -203,8 +211,7 @@ namespace Stratis.Bitcoin.Features.BlockStore.Controllers
                 return ErrorHelpers.BuildErrorResponse(HttpStatusCode.BadRequest, e.Message, e.ToString());
             }
         }
-
-
+        
         /// <summary>Provides verbose balance data of the given addresses.</summary>
         /// <param name="addresses">A comma delimited set of addresses that will be queried.</param>
         /// <returns>A result object containing the balance for each requested address and if so, a message stating why the indexer is not queryable.</returns>
@@ -225,6 +232,40 @@ namespace Stratis.Bitcoin.Features.BlockStore.Controllers
                 VerboseAddressBalancesResult result = this.addressIndexer.GetAddressIndexerState(addressesArray);
 
                 return this.Json(result);
+            }
+            catch (Exception e)
+            {
+                this.logger.LogError("Exception occurred: {0}", e.ToString());
+                return ErrorHelpers.BuildErrorResponse(HttpStatusCode.BadRequest, e.Message, e.ToString());
+            }
+        }
+
+        /// <summary>Returns every UTXO as of a given block height. This may take some time for large chains.</summary>
+        /// <param name="atBlockHeight">Only process blocks up to this height for the purposes of constructing the UTXO set.</param>
+        /// <returns>A result object containing the UTXOs.</returns>
+        /// <response code="200">Returns the UTXO set.</response>
+        /// <response code="400">Unexpected exception occurred</response>
+        [Route(BlockStoreRouteEndPoint.GetUtxoSet)]
+        [HttpGet]
+        [ProducesResponseType((int)HttpStatusCode.OK)]
+        [ProducesResponseType((int)HttpStatusCode.BadRequest)]
+        public IActionResult GetUtxoSet(int atBlockHeight)
+        {
+            try
+            {
+                ReconstructedCoinviewContext coinView = this.utxoIndexer.GetCoinviewAtHeight(atBlockHeight);
+
+                var outputs = new List<UtxoModel>();
+
+                foreach (OutPoint outPoint in coinView.UnspentOutputs)
+                {
+                    TxOut txOut = coinView.Transactions[outPoint.Hash].Outputs[outPoint.N];
+                    var utxo = new UtxoModel() { TxId = outPoint.Hash, Index = outPoint.N, ScriptPubKey = txOut.ScriptPubKey, Value = txOut.Value };
+
+                    outputs.Add(utxo);
+                }
+                
+                return this.Json(outputs);
             }
             catch (Exception e)
             {

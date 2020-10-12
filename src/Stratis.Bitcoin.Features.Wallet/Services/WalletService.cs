@@ -12,6 +12,7 @@ using NBitcoin;
 using Stratis.Bitcoin.Builder.Feature;
 using Stratis.Bitcoin.Connection;
 using Stratis.Bitcoin.Consensus;
+using Stratis.Bitcoin.Features.BlockStore;
 using Stratis.Bitcoin.Features.Wallet.Broadcasting;
 using Stratis.Bitcoin.Features.Wallet.Controllers;
 using Stratis.Bitcoin.Features.Wallet.Helpers;
@@ -35,6 +36,7 @@ namespace Stratis.Bitcoin.Features.Wallet.Services
         private readonly IDateTimeProvider dateTimeProvider;
         private readonly CoinType coinType;
         private readonly ILogger logger;
+        private readonly IUtxoIndexer utxoIndexer;
 
         public WalletService(ILoggerFactory loggerFactory,
             IWalletManager walletManager,
@@ -45,7 +47,8 @@ namespace Stratis.Bitcoin.Features.Wallet.Services
             Network network,
             ChainIndexer chainIndexer,
             IBroadcasterManager broadcasterManager,
-            IDateTimeProvider dateTimeProvider)
+            IDateTimeProvider dateTimeProvider,
+            IUtxoIndexer utxoIndexer)
         {
             this.walletManager = walletManager;
             this.consensusManager = consensusManager;
@@ -58,6 +61,7 @@ namespace Stratis.Bitcoin.Features.Wallet.Services
             this.dateTimeProvider = dateTimeProvider;
             this.coinType = (CoinType)network.Consensus.CoinType;
             this.logger = loggerFactory.CreateLogger(this.GetType().FullName);
+            this.utxoIndexer = utxoIndexer;
         }
 
         public async Task<IEnumerable<string>> GetWalletNames(
@@ -646,11 +650,30 @@ namespace Stratis.Bitcoin.Features.Wallet.Services
                         throw new FeatureException(HttpStatusCode.BadRequest, "No recipients.", "Either one or both of recipients and opReturnAmount must be specified.");
                 }
 
-                var recipients = request.Recipients.Select(recipientModel => new Recipient
+                var recipients = new List<Recipient>();
+
+                foreach (RecipientModel recipientModel in request.Recipients)
                 {
-                    ScriptPubKey = BitcoinAddress.Create(recipientModel.DestinationAddress, this.network).ScriptPubKey,
-                    Amount = recipientModel.Amount
-                }).ToList();
+                    if (string.IsNullOrWhiteSpace(recipientModel.DestinationAddress) || string.IsNullOrWhiteSpace(recipientModel.DestinationScript))
+                        throw new FeatureException(HttpStatusCode.BadRequest, "No recipient address.", "Either a destination address or script must be specified.");
+
+                    Script destination;
+
+                    if (!string.IsNullOrWhiteSpace(recipientModel.DestinationAddress))
+                    {
+                        destination = BitcoinAddress.Create(recipientModel.DestinationAddress, this.network).ScriptPubKey;
+                    }
+                    else
+                    {
+                        destination = Script.FromHex(recipientModel.DestinationScript);
+                    }
+
+                    recipients.Add(new Recipient
+                    {
+                        ScriptPubKey = destination,
+                        Amount = recipientModel.Amount
+                    });
+                }
 
                 // If specified, get the change address, which must already exist in the wallet.
                 HdAddress changeAddress = null;
@@ -670,7 +693,7 @@ namespace Stratis.Bitcoin.Features.Wallet.Services
                     if (changeAddress == null)
                     {
                         throw new FeatureException(HttpStatusCode.BadRequest, "Change address not found.",
-                            $"No changed address '{request.ChangeAddress}' could be found in wallet {wallet.Name}.");
+                            $"No change address '{request.ChangeAddress}' could be found in wallet {wallet.Name}.");
                     }
                 }
 
@@ -1067,6 +1090,46 @@ namespace Stratis.Bitcoin.Features.Wallet.Services
                 }
 
                 return model;
+            }, cancellationToken);
+        }
+
+        public async Task<List<string>> Sweep(SweepRequest request, CancellationToken cancellationToken)
+        {
+            // Build the list of scriptPubKeys to look for.
+            var scriptList = new HashSet<Script>();
+
+            // Currently this is only designed to support P2PK and P2PKH, although segwit scripts are probably easily added.
+            // Both P2PK and P2PKH will be swept to a specified P2PKH destination address.
+            foreach (string wif in request.PrivateKeys)
+            {
+                var privateKey = Key.Parse(wif, this.network);
+
+                scriptList.Add(PayToPubkeyTemplate.Instance.GenerateScriptPubKey(privateKey.PubKey));
+                scriptList.Add(PayToPubkeyHashTemplate.Instance.GenerateScriptPubKey(privateKey.PubKey));
+            }
+
+            var sweptList = new List<string>();
+
+            return await Task.Run(() =>
+            {
+                var coinView = this.utxoIndexer.GetCoinviewAtHeight(this.chainIndexer.Height);
+
+                foreach (OutPoint outPoint in coinView.UnspentOutputs)
+                {
+                    // Obtain the transaction output in question.
+                    TxOut txOut = coinView.Transactions[outPoint.Hash].Outputs[outPoint.N];
+
+                    // Check if the scriptPubKey matches one of those for the supplied private keys.
+                    if (!scriptList.Contains(txOut.ScriptPubKey))
+                    {
+                        continue;
+                    }
+
+                    // TODO: Build the sweeping transaction
+                    sweptList.Add(outPoint.Hash.ToString() + "-" + outPoint.N.ToString());
+                }
+
+                return sweptList;
             }, cancellationToken);
         }
 
